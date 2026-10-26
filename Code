@@ -1,0 +1,448 @@
+"""
+Automatisierte Stellensuche: Tourismus / Kultur / Marketing im Raum Riedenburg
+==============================================================================
+NUR VOLLZEIT-STELLEN (Teilzeit wird herausgefiltert)
+
+Was macht das Skript?
+1. Geht eine Liste von Städten, Gemeinden, Landkreisen und Tourismus-Stellen durch.
+2. Findet auf jeder Webseite automatisch die Seite mit den Stellenangeboten.
+3. Durchsucht diese Seiten (inkl. PDFs) nach passenden Stichwörtern.
+4. Ermittelt die Arbeitszeit (Vollzeit / Teilzeit) aus Titel, PDF oder Detailseite
+   und filtert reine Teilzeitstellen heraus.
+5. Speichert die Treffer als CSV + HTML-Bericht und markiert NEUE Stellen.
+
+Installation (einmalig):
+    pip install requests beautifulsoup4 pypdf
+
+Start:
+    python stellensuche_riedenburg_vollzeit.py
+    python stellensuche_riedenburg_vollzeit.py --streng      (auch "unbekannt" raus)
+    python stellensuche_riedenburg_vollzeit.py --ohne-pdf    (schneller)
+    python stellensuche_riedenburg_vollzeit.py --nur-neue    (nur neue Treffer)
+"""
+
+import argparse
+import csv
+import io
+import json
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+from urllib.robotparser import RobotFileParser
+
+import requests
+from bs4 import BeautifulSoup
+
+try:
+    from pypdf import PdfReader
+except ImportError:          # PDF-Suche ist optional
+    PdfReader = None
+
+
+# ---------------------------------------------------------------------------
+# 1) KONFIGURATION – hier kannst du alles anpassen
+# ---------------------------------------------------------------------------
+
+# Name -> (Startseite, direkte Stellenseite oder None)
+# URLs bitte einmal im Browser prüfen.
+ORTE = {
+    # Landkreis Kelheim
+    "Stadt Riedenburg":            ("https://www.riedenburg.de", None),
+    "Stadt Kelheim":               ("https://www.kelheim.de", None),
+    "Landkreis Kelheim":           ("https://www.landkreis-kelheim.de", None),
+    "Markt Essing":                ("https://www.essing.de", None),
+    "Gemeinde Ihrlerstein":        ("https://www.ihrlerstein.de", None),
+    "Markt Painten":               ("https://www.painten.de", None),
+    "Stadt Abensberg":             ("https://www.abensberg.de", None),
+    "Stadt Neustadt a.d. Donau":   ("https://www.neustadt-donau.de", None),
+    "Markt Bad Abbach":            ("https://www.bad-abbach.de", None),
+    "Gemeinde Saal a.d. Donau":    ("https://www.saal-donau.de", None),
+    "Markt Mindelstetten":         ("https://www.mindelstetten.de", None),
+    # Landkreis Eichstätt
+    "Markt Altmannstein":          ("https://www.altmannstein.de", None),
+    "Stadt Beilngries":            ("https://www.beilngries.de", None),
+    "Markt Kipfenberg":            ("https://www.kipfenberg.de", None),
+    "Markt Kinding":               ("https://www.kinding.de", None),
+    "Gemeinde Denkendorf":         ("https://www.denkendorf.de", None),
+    "Stadt Eichstätt":             ("https://www.eichstaett.de", None),
+    "Landkreis Eichstätt":         ("https://www.landkreis-eichstaett.de", None),
+    # Landkreis Neumarkt / Regensburg
+    "Stadt Dietfurt a.d. Altmühl": ("https://www.dietfurt.de", None),
+    "Markt Breitenbrunn":          ("https://www.breitenbrunn.de", None),
+    "Landkreis Neumarkt i.d.OPf.": ("https://www.landkreis-neumarkt.de", None),
+    "Stadt Hemau":                 ("https://www.hemau.de", None),
+    "Landkreis Regensburg":        ("https://www.landkreis-regensburg.de", None),
+    # Größere Städte im Pendelbereich
+    "Stadt Ingolstadt":            ("https://www.ingolstadt.de", None),
+    "Stadt Regensburg":            ("https://www.regensburg.de", None),
+    # Tourismus-Organisationen
+    "Naturpark Altmühltal":        ("https://www.naturpark-altmuehltal.de", None),
+}
+
+# Treffer, wenn mindestens EIN Stichwort vorkommt (Groß/Klein egal).
+STICHWOERTER = [
+    "tourismus", "touristik", "touristinfo", "tourist-info", "tourist info",
+    "gästeinformation", "gästeservice", "fremdenverkehr",
+    "kultur", "kulturamt", "kulturmanagement", "kulturbüro", "kulturreferat",
+    "museum", "archiv", "bibliothek", "bücherei", "heimatpflege",
+    "marketing", "stadtmarketing", "standortmarketing", "citymanagement",
+    "öffentlichkeitsarbeit", "pressearbeit", "kommunikation", "social media",
+    "veranstaltung", "event", "wirtschaftsförderung", "regionalentwicklung" , 
+    "regionalmanagement", "bildung"
+]
+
+# Treffer werden verworfen, wenn eines dieser Wörter vorkommt.
+AUSSCHLUSS = ["kläranlage", "bauhof", "erzieher", "kinderpfleger"]
+
+# --- NEU: Arbeitszeit-Filter -----------------------------------------------
+# Mögliche Werte: "Vollzeit", "Voll- oder Teilzeit", "Teilzeit", "unbekannt"
+# Standard: alles außer reiner Teilzeit bleibt drin.
+# "unbekannt" bleibt drin, weil Gemeinden die Arbeitszeit oft nicht angeben –
+# mit --streng werden auch diese entfernt.
+ERLAUBTE_ARBEITSZEITEN = {"Vollzeit", "Voll- oder Teilzeit", "unbekannt"}
+VOLLZEIT_AB_STUNDEN = 38.5        # ab so vielen Wochenstunden = Vollzeit
+MAX_DETAILSEITEN_PRO_ORT = 15     # Detailseiten laden, um die Arbeitszeit zu finden
+
+# Woran erkennt man einen Link zur Stellenseite?
+STELLEN_LINK_WOERTER = [
+    "stellenangebot", "stellenausschreibung", "stellenanzeige", "stellenbörse",
+    "karriere", "jobs", "job", "ausschreibung", "arbeiten bei", "arbeitgeber",
+    "offene stellen", "bewerbung",
+]
+
+STANDARD_PFADE = [
+    "/stellenangebote", "/stellenausschreibungen", "/karriere", "/jobs",
+    "/rathaus/stellenangebote", "/buergerservice/stellenangebote",
+]
+
+AUSGABE_ORDNER = Path("ergebnisse")
+GEDAECHTNIS_DATEI = AUSGABE_ORDNER / "bereits_gefunden.json"
+PAUSE_SEKUNDEN = 1.5
+TIMEOUT = 20
+MAX_STELLENSEITEN_PRO_ORT = 4
+MAX_PDFS_PRO_ORT = 15
+USER_AGENT = "Mozilla/5.0 (privates Stellensuche-Skript; Python requests)"
+
+
+# ---------------------------------------------------------------------------
+# 2) HILFSFUNKTIONEN
+# ---------------------------------------------------------------------------
+
+session = requests.Session()
+session.headers.update({"User-Agent": USER_AGENT})
+_robots_cache = {}
+
+
+def darf_abrufen(url):
+    """Prüft robots.txt der Webseite."""
+    basis = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    if basis not in _robots_cache:
+        rp = RobotFileParser()
+        try:
+            antwort = session.get(basis + "/robots.txt", timeout=TIMEOUT)
+            rp.parse(antwort.text.splitlines() if antwort.ok else [])
+        except requests.RequestException:
+            rp.parse([])
+        _robots_cache[basis] = rp
+    return _robots_cache[basis].can_fetch(USER_AGENT, url)
+
+
+def lade(url):
+    """Lädt eine URL. Gibt die Antwort zurück oder None bei Fehler."""
+    if not darf_abrufen(url):
+        print(f"    robots.txt verbietet: {url}")
+        return None
+    try:
+        time.sleep(PAUSE_SEKUNDEN)
+        antwort = session.get(url, timeout=TIMEOUT)
+        if antwort.ok:
+            return antwort
+        print(f"    HTTP {antwort.status_code}: {url}")
+    except requests.RequestException as fehler:
+        print(f"    Fehler bei {url}: {type(fehler).__name__}")
+    return None
+
+
+def finde_stichwoerter(text):
+    """Gibt die gefundenen Stichwörter zurück (leere Liste = kein Treffer)."""
+    text = text.lower()
+    if any(wort in text for wort in AUSSCHLUSS):
+        return []
+    return [wort for wort in STICHWOERTER if wort in text]
+
+
+def ermittle_arbeitszeit(text):
+    """Erkennt aus einem Text: Vollzeit, Teilzeit, beides oder unbekannt."""
+    text = text.lower()
+
+    # "Voll-/Teilzeit", "Voll- oder Teilzeit", "teilzeitfähig" -> beides möglich
+    if re.search(r"voll\s*-?\s*(/|oder|und|bzw\.?)\s*teilzeit", text) \
+            or re.search(r"teilzeit\w*\s*(fähig|geeignet|möglich)|teilbar", text):
+        return "Voll- oder Teilzeit"
+
+    voll = "vollzeit" in text
+    teil = any(w in text for w in ["teilzeit", "minijob", "geringfügig", "aushilfe"])
+
+    # Wochenstunden auswerten, z.B. "39 Wochenstunden", "19,5 Std."
+    for zahl in re.findall(r"(\d{1,2}(?:[.,]\d{1,2})?)\s*(?:wochenstunden|stunden|std\b)", text):
+        stunden = float(zahl.replace(",", "."))
+        if stunden >= VOLLZEIT_AB_STUNDEN:
+            voll = True
+        elif 5 <= stunden < VOLLZEIT_AB_STUNDEN:
+            teil = True
+
+    if voll and teil:
+        return "Voll- oder Teilzeit"
+    if voll:
+        return "Vollzeit"
+    if teil:
+        return "Teilzeit"
+    return "unbekannt"
+
+
+def ist_pdf(url):
+    return urlparse(url).path.lower().endswith(".pdf")
+
+
+def pdf_text(url):
+    """Liest den Text einer PDF-Stellenausschreibung (erste 3 Seiten)."""
+    if PdfReader is None:
+        return ""
+    antwort = lade(url)
+    if antwort is None:
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(antwort.content))
+        return " ".join((seite.extract_text() or "") for seite in reader.pages[:3])
+    except Exception:
+        return ""
+
+
+def seiten_text(url):
+    """Lädt eine HTML-Detailseite und gibt deren Haupttext zurück."""
+    antwort = lade(url)
+    if antwort is None or "html" not in antwort.headers.get("Content-Type", ""):
+        return ""
+    soup = BeautifulSoup(antwort.text, "html.parser")
+    for stoerer in soup(["nav", "header", "footer", "script", "style"]):
+        stoerer.decompose()
+    return soup.get_text(" ", strip=True)[:20000]
+
+
+# ---------------------------------------------------------------------------
+# 3) STELLENSEITEN FINDEN
+# ---------------------------------------------------------------------------
+
+def finde_stellenseiten(startseite):
+    """Sucht auf der Startseite nach Links zu Stellenangeboten."""
+    gefunden = []
+    antwort = lade(startseite)
+    if antwort is not None:
+        soup = BeautifulSoup(antwort.text, "html.parser")
+        for link in soup.find_all("a", href=True):
+            linktext = (link.get_text(" ", strip=True) + " " + link["href"]).lower()
+            if any(wort in linktext for wort in STELLEN_LINK_WOERTER):
+                ziel = urljoin(antwort.url, link["href"])
+                if ziel.startswith("http") and ziel not in gefunden and not ist_pdf(ziel):
+                    gefunden.append(ziel)
+
+    if not gefunden:
+        for pfad in STANDARD_PFADE:
+            versuch = urljoin(startseite, pfad)
+            if lade(versuch) is not None:
+                gefunden.append(versuch)
+                break
+
+    gefunden.sort(key=lambda u: 0 if "stellen" in u.lower() else 1)
+    return gefunden[:MAX_STELLENSEITEN_PRO_ORT]
+
+
+# ---------------------------------------------------------------------------
+# 4) STELLENSEITE DURCHSUCHEN
+# ---------------------------------------------------------------------------
+
+def durchsuche_stellenseite(ort, url, mit_pdf):
+    """Durchsucht eine Stellenseite und gibt eine Liste von Treffern zurück."""
+    treffer = []
+    antwort = lade(url)
+    if antwort is None:
+        return treffer
+
+    soup = BeautifulSoup(antwort.text, "html.parser")
+    for stoerer in soup(["nav", "header", "footer", "script", "style"]):
+        stoerer.decompose()
+
+    pdf_zaehler = 0
+    detail_zaehler = 0
+    for link in soup.find_all("a", href=True):
+        titel = link.get_text(" ", strip=True)
+        ziel = urljoin(antwort.url, link["href"])
+        if not titel or not ziel.startswith("http"):
+            continue
+
+        umgebung = link.find_parent(["li", "article", "div", "tr", "p"])
+        kontext = umgebung.get_text(" ", strip=True)[:500] if umgebung else ""
+        kurztext = titel + " " + kontext
+        woerter = finde_stichwoerter(kurztext + " " + ziel)
+        volltext = ""          # Text der PDF/Detailseite (für Arbeitszeit)
+
+        # PDF ohne aussagekräftigen Linktext: Inhalt lesen
+        if not woerter and mit_pdf and ist_pdf(ziel) and pdf_zaehler < MAX_PDFS_PRO_ORT:
+            pdf_zaehler += 1
+            volltext = pdf_text(ziel)
+            woerter = finde_stichwoerter(volltext)
+
+        if not woerter:
+            continue
+
+        # Arbeitszeit: zuerst aus Titel/Umfeld, sonst aus PDF bzw. Detailseite
+        arbeitszeit = ermittle_arbeitszeit(kurztext)
+        if arbeitszeit == "unbekannt":
+            if not volltext:
+                if ist_pdf(ziel) and mit_pdf and pdf_zaehler < MAX_PDFS_PRO_ORT:
+                    pdf_zaehler += 1
+                    volltext = pdf_text(ziel)
+                elif not ist_pdf(ziel) and ziel != url and detail_zaehler < MAX_DETAILSEITEN_PRO_ORT:
+                    detail_zaehler += 1
+                    volltext = seiten_text(ziel)
+            arbeitszeit = ermittle_arbeitszeit(volltext)
+
+        treffer.append({
+            "ort": ort,
+            "titel": titel[:200],
+            "arbeitszeit": arbeitszeit,
+            "link": ziel,
+            "stichwoerter": ", ".join(sorted(set(woerter))),
+            "gefunden_auf": url,
+        })
+
+    # Überschriften ohne Link (manche Seiten listen Stellen nur als Text)
+    for ueberschrift in soup.find_all(["h2", "h3", "h4"]):
+        text = ueberschrift.get_text(" ", strip=True)
+        woerter = finde_stichwoerter(text)
+        if woerter and len(text) < 200:
+            # Text bis zur nächsten Überschrift für die Arbeitszeit nutzen
+            abschnitt = text
+            for geschwister in ueberschrift.find_next_siblings():
+                if geschwister.name in ("h2", "h3", "h4"):
+                    break
+                abschnitt += " " + geschwister.get_text(" ", strip=True)
+            treffer.append({
+                "ort": ort, "titel": text,
+                "arbeitszeit": ermittle_arbeitszeit(abschnitt[:3000]),
+                "link": url,
+                "stichwoerter": ", ".join(sorted(set(woerter))),
+                "gefunden_auf": url,
+            })
+    return treffer
+
+
+# ---------------------------------------------------------------------------
+# 5) ERGEBNISSE SPEICHERN
+# ---------------------------------------------------------------------------
+
+def lade_gedaechtnis():
+    if GEDAECHTNIS_DATEI.exists():
+        return set(json.loads(GEDAECHTNIS_DATEI.read_text(encoding="utf-8")))
+    return set()
+
+
+def speichere_gedaechtnis(schluessel):
+    GEDAECHTNIS_DATEI.write_text(json.dumps(sorted(schluessel), ensure_ascii=False, indent=1),
+                                 encoding="utf-8")
+
+
+def speichere_csv(treffer, datei):
+    felder = ["neu", "ort", "titel", "arbeitszeit", "stichwoerter", "link", "gefunden_auf"]
+    with open(datei, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=felder, delimiter=";")
+        writer.writeheader()
+        writer.writerows(treffer)
+
+
+def speichere_html(treffer, fehler_orte, anzahl_teilzeit, datei):
+    zeilen = "\n".join(
+        f"<tr class='{'neu' if t['neu'] == 'JA' else ''}'><td>{t['neu']}</td><td>{t['ort']}</td>"
+        f"<td><a href='{t['link']}' target='_blank'>{t['titel']}</a></td>"
+        f"<td>{t['arbeitszeit']}</td><td>{t['stichwoerter']}</td></tr>"
+        for t in treffer
+    )
+    fehler = "".join(f"<li>{o}</li>" for o in fehler_orte) or "<li>keine</li>"
+    html = f"""<!DOCTYPE html><html lang="de"><head><meta charset="utf-8">
+<title>Stellensuche {datetime.now():%d.%m.%Y}</title>
+<style>body{{font-family:Segoe UI,Arial;margin:2em}}table{{border-collapse:collapse;width:100%}}
+td,th{{border:1px solid #ccc;padding:6px;text-align:left}}th{{background:#2b5797;color:#fff}}
+tr.neu{{background:#e6ffe6;font-weight:bold}}</style></head><body>
+<h1>Stellensuche Tourismus / Kultur / Marketing – Raum Riedenburg (Vollzeit)</h1>
+<p>Stand: {datetime.now():%d.%m.%Y %H:%M} · {len(treffer)} Treffer
+ · davon neu: {sum(t['neu'] == 'JA' for t in treffer)}
+ · {anzahl_teilzeit} Teilzeitstellen ausgefiltert</p>
+<table><tr><th>Neu</th><th>Ort</th><th>Stelle</th><th>Arbeitszeit</th><th>Stichwörter</th></tr>{zeilen}</table>
+<h3>Keine Stellenseite gefunden (bitte URL manuell in ORTE eintragen):</h3><ul>{fehler}</ul>
+</body></html>"""
+    Path(datei).write_text(html, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 6) HAUPTPROGRAMM
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Stellensuche Raum Riedenburg (Vollzeit)")
+    parser.add_argument("--ohne-pdf", action="store_true", help="PDFs nicht auslesen")
+    parser.add_argument("--nur-neue", action="store_true", help="nur neue Treffer ausgeben")
+    parser.add_argument("--streng", action="store_true",
+                        help="auch Stellen ohne Arbeitszeit-Angabe ausfiltern")
+    args = parser.parse_args()
+
+    erlaubt = set(ERLAUBTE_ARBEITSZEITEN)
+    if args.streng:
+        erlaubt.discard("unbekannt")
+
+    AUSGABE_ORDNER.mkdir(exist_ok=True)
+    bekannt = lade_gedaechtnis()
+    alle_treffer, fehler_orte, gesehen = [], [], set()
+    ausgefiltert = 0
+
+    for ort, (startseite, stellenseite) in ORTE.items():
+        print(f"\n>> {ort}")
+        seiten = [stellenseite] if stellenseite else finde_stellenseiten(startseite)
+        if not seiten:
+            print("    keine Stellenseite gefunden")
+            fehler_orte.append(f"{ort} ({startseite})")
+            continue
+        for seite in seiten:
+            print(f"    durchsuche {seite}")
+            for t in durchsuche_stellenseite(ort, seite, mit_pdf=not args.ohne_pdf):
+                schluessel = f"{t['link']}|{t['titel']}"
+                if schluessel in gesehen:
+                    continue
+                gesehen.add(schluessel)
+                if t["arbeitszeit"] not in erlaubt:
+                    ausgefiltert += 1
+                    print(f"    - ausgefiltert ({t['arbeitszeit']}): {t['titel'][:60]}")
+                    continue
+                t["neu"] = "NEIN" if schluessel in bekannt else "JA"
+                alle_treffer.append(t)
+
+    if args.nur_neue:
+        alle_treffer = [t for t in alle_treffer if t["neu"] == "JA"]
+    reihenfolge = {"Vollzeit": 0, "Voll- oder Teilzeit": 1, "unbekannt": 2}
+    alle_treffer.sort(key=lambda t: (t["neu"] != "JA", reihenfolge.get(t["arbeitszeit"], 3), t["ort"]))
+
+    stempel = f"{datetime.now():%Y-%m-%d_%H%M}"
+    csv_datei = AUSGABE_ORDNER / f"stellen_{stempel}.csv"
+    html_datei = AUSGABE_ORDNER / f"stellen_{stempel}.html"
+    speichere_csv(alle_treffer, csv_datei)
+    speichere_html(alle_treffer, fehler_orte, ausgefiltert, html_datei)
+    speichere_gedaechtnis(bekannt | gesehen)
+
+    neu = sum(t["neu"] == "JA" for t in alle_treffer)
+    print(f"\nFertig: {len(alle_treffer)} Treffer, davon {neu} neu, {ausgefiltert} Teilzeit ausgefiltert.")
+    print(f"Bericht: {html_datei.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
