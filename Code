@@ -68,6 +68,7 @@ ORTE = {
     "Gemeinde Denkendorf":         ("https://www.denkendorf.de", None),
     "Stadt Eichstätt":             ("https://www.eichstaett.de", None),
     "Landkreis Eichstätt":         ("https://www.landkreis-eichstaett.de", None),
+    "Landkreis Eichstätt 2":       ("https://www.mein-check-in.de/landkreis-eichstaett/stellenangebote", None),
     # Landkreis Neumarkt / Regensburg
     "Stadt Dietfurt a.d. Altmühl": ("https://www.dietfurt.de", None),
     "Markt Breitenbrunn":          ("https://www.breitenbrunn.de", None),
@@ -93,8 +94,62 @@ STICHWOERTER = [
     "regionalmanagement", "bildung"
 ]
 
-# Treffer werden verworfen, wenn eines dieser Wörter vorkommt.
-AUSSCHLUSS = ["kläranlage", "bauhof", "erzieher", "kinderpfleger"]
+# Allgemeine fachliche Ausschlüsse.
+AUSSCHLUSS = [
+    "kläranlage",
+    "bauhof",
+    "erzieher",
+    "kinderpfleger",
+]
+
+# Diese Begriffe werden nur im Titel und in der URL geprüft.
+#
+# Wichtig:
+# Der komplette Text einer Stellenanzeige wird hier bewusst nicht geprüft.
+# Ansonsten würde beispielsweise die Formulierung
+# "abgeschlossene Ausbildung erforderlich" eine normale Stelle ausschließen.
+UNPASSENDE_TITEL_WOERTER = [
+    # Ausbildung und Nachwuchsprogramme
+    "ausbildungsplatz",
+    "ausbildungsplätze",
+    "ausbildungsstelle",
+    "ausbildungsstellen",
+    "ausbildung am",
+    "ausbildung zum",
+    "ausbildung zur",
+    "auszubildende",
+    "auszubildender",
+    "azubi",
+    "duales studium",
+    "dual studieren",
+    "praktikumsplatz",
+    "freiwilliges soziales jahr",
+    "bundesfreiwilligendienst",
+
+    # Fachlich unpassende Stellen
+    "bautechnik",
+    "vergabewesen",
+    "bauingenieur",
+    "tiefbau",
+    "hochbau",
+]
+
+# Allgemeine Karriere- und Stellenübersichtsseiten.
+# Diese Seiten dürfen durchsucht werden, sollen aber nicht selbst
+# als Stellenangebot ausgegeben werden.
+ALLGEMEINE_SEITENTITEL = {
+    "karriere",
+    "karriereportal",
+    "stellenangebote",
+    "stellenanzeigen",
+    "stellenbörse",
+    "stellenboerse",
+    "jobangebote",
+    "jobs",
+    "offene stellen",
+    "arbeiten bei uns",
+    "ausbildung",
+}
 
 # --- NEU: Arbeitszeit-Filter -----------------------------------------------
 # Mögliche Werte: "Vollzeit", "Voll- oder Teilzeit", "Teilzeit", "unbekannt"
@@ -165,12 +220,79 @@ def lade(url):
     return None
 
 
+def enthaelt_begriff(text, begriff):
+    """
+    Prüft, ob ein Begriff als eigenständiger Ausdruck vorkommt.
+
+    Das verhindert zum Beispiel, dass das Stichwort "bildung"
+    innerhalb des Wortes "ausbildung" gefunden wird.
+    """
+    muster = rf"(?<!\w){re.escape(begriff.lower())}(?!\w)"
+    return re.search(muster, text.lower()) is not None
+
+
 def finde_stichwoerter(text):
-    """Gibt die gefundenen Stichwörter zurück (leere Liste = kein Treffer)."""
+    """
+    Gibt die gefundenen Stichwörter zurück.
+
+    Eine leere Liste bedeutet, dass kein passender Treffer gefunden wurde.
+    """
     text = text.lower()
-    if any(wort in text for wort in AUSSCHLUSS):
+
+    if any(enthaelt_begriff(text, wort) for wort in AUSSCHLUSS):
         return []
-    return [wort for wort in STICHWOERTER if wort in text]
+
+    return [
+        wort
+        for wort in STICHWOERTER
+        if enthaelt_begriff(text, wort)
+    ]
+
+
+def ist_unpassender_treffer(titel, url):
+    """
+    Erkennt Ausbildungsangebote und fachlich unpassende Stellen.
+
+    Es werden bewusst nur Titel und URL geprüft. Der vollständige
+    Ausschreibungstext wird nicht berücksichtigt, weil dort zum Beispiel
+    eine "abgeschlossene Ausbildung" als Voraussetzung genannt werden kann.
+    """
+    prueftext = f"{titel} {url}".lower()
+
+    return any(
+        wort in prueftext
+        for wort in UNPASSENDE_TITEL_WOERTER
+    )
+
+
+def ist_allgemeine_stellenseite(titel, url):
+    """
+    Erkennt allgemeine Karriere- und Stellenübersichtsseiten.
+
+    Solche Seiten sollen als Ausgangspunkt durchsucht werden, aber nicht
+    selbst als konkrete Stelle in den Ergebnissen erscheinen.
+    """
+    titel_normalisiert = re.sub(
+        r"\s+",
+        " ",
+        titel.lower()
+    ).strip(" -–|:")
+
+    if titel_normalisiert in ALLGEMEINE_SEITENTITEL:
+        return True
+
+    pfad = urlparse(url).path.lower().rstrip("/")
+
+    allgemeine_pfade = (
+        "/karriere",
+        "/jobs",
+        "/stellenangebote",
+        "/stellenausschreibungen",
+        "/stellenboerse",
+        "/stellenbörse",
+    )
+
+    return pfad.endswith(allgemeine_pfade)
 
 
 def ermittle_arbeitszeit(text):
@@ -264,49 +386,120 @@ def finde_stellenseiten(startseite):
 # ---------------------------------------------------------------------------
 
 def durchsuche_stellenseite(ort, url, mit_pdf):
-    """Durchsucht eine Stellenseite und gibt eine Liste von Treffern zurück."""
+    """
+    Durchsucht eine Stellenübersicht und gibt konkrete,
+    fachlich passende Treffer zurück.
+    """
     treffer = []
+
     antwort = lade(url)
     if antwort is None:
         return treffer
 
+    content_type = antwort.headers.get("Content-Type", "").lower()
+    if "html" not in content_type:
+        return treffer
+
     soup = BeautifulSoup(antwort.text, "html.parser")
-    for stoerer in soup(["nav", "header", "footer", "script", "style"]):
+
+    for stoerer in soup([
+        "nav",
+        "header",
+        "footer",
+        "script",
+        "style",
+    ]):
         stoerer.decompose()
 
     pdf_zaehler = 0
     detail_zaehler = 0
+
     for link in soup.find_all("a", href=True):
         titel = link.get_text(" ", strip=True)
         ziel = urljoin(antwort.url, link["href"])
-        if not titel or not ziel.startswith("http"):
+
+        if not titel:
             continue
 
-        umgebung = link.find_parent(["li", "article", "div", "tr", "p"])
-        kontext = umgebung.get_text(" ", strip=True)[:500] if umgebung else ""
-        kurztext = titel + " " + kontext
-        woerter = finde_stichwoerter(kurztext + " " + ziel)
-        volltext = ""          # Text der PDF/Detailseite (für Arbeitszeit)
+        if not ziel.startswith("http"):
+            continue
 
-        # PDF ohne aussagekräftigen Linktext: Inhalt lesen
+        # Ausbildungsplätze und klar unpassende Stellen sofort entfernen.
+        if ist_unpassender_treffer(titel, ziel):
+            print(
+                f"    - unpassender Treffer: "
+                f"{titel[:70]}"
+            )
+            continue
+
+        # Allgemeine Karriere- und Stellenübersichtsseiten sind keine
+        # konkreten Stellenangebote und werden daher nicht gespeichert.
+        if ist_allgemeine_stellenseite(titel, ziel):
+            continue
+
+        umgebung = link.find_parent([
+            "li",
+            "article",
+            "div",
+            "tr",
+            "p",
+        ])
+
+        if umgebung:
+            kontext = umgebung.get_text(
+                " ",
+                strip=True
+            )[:500]
+        else:
+            kontext = ""
+
+        kurztext = f"{titel} {kontext}"
+        volltext = ""
+
+        # Die URL wird bewusst nicht mehr für positive Stichworttreffer
+        # verwendet. Dadurch lösen Begriffe aus Navigationspfaden oder
+        # allgemeinen Karriere-URLs keinen falschen Treffer aus.
+        woerter = finde_stichwoerter(kurztext)
+
+        # Wenn der Titel einer PDF nicht aussagekräftig ist,
+        # wird der Inhalt der PDF geprüft.
         if not woerter and mit_pdf and ist_pdf(ziel) and pdf_zaehler < MAX_PDFS_PRO_ORT:
             pdf_zaehler += 1
             volltext = pdf_text(ziel)
+
+            # Noch einmal mit dem aus der PDF ermittelten Text prüfen.
+            if ist_unpassender_treffer(titel, ziel):
+                continue
+
             woerter = finde_stichwoerter(volltext)
 
         if not woerter:
             continue
 
-        # Arbeitszeit: zuerst aus Titel/Umfeld, sonst aus PDF bzw. Detailseite
+        # Arbeitszeit zunächst anhand des Titels und des direkten
+        # Seitenumfelds bestimmen.
         arbeitszeit = ermittle_arbeitszeit(kurztext)
+
+        # Falls dort keine Arbeitszeit steht, wird die PDF oder
+        # die Detailseite untersucht.
         if arbeitszeit == "unbekannt":
             if not volltext:
-                if ist_pdf(ziel) and mit_pdf and pdf_zaehler < MAX_PDFS_PRO_ORT:
+                if (
+                    ist_pdf(ziel)
+                    and mit_pdf
+                    and pdf_zaehler < MAX_PDFS_PRO_ORT
+                ):
                     pdf_zaehler += 1
                     volltext = pdf_text(ziel)
-                elif not ist_pdf(ziel) and ziel != url and detail_zaehler < MAX_DETAILSEITEN_PRO_ORT:
+
+                elif (
+                    not ist_pdf(ziel)
+                    and ziel != url
+                    and detail_zaehler < MAX_DETAILSEITEN_PRO_ORT
+                ):
                     detail_zaehler += 1
                     volltext = seiten_text(ziel)
+
             arbeitszeit = ermittle_arbeitszeit(volltext)
 
         treffer.append({
@@ -314,28 +507,68 @@ def durchsuche_stellenseite(ort, url, mit_pdf):
             "titel": titel[:200],
             "arbeitszeit": arbeitszeit,
             "link": ziel,
-            "stichwoerter": ", ".join(sorted(set(woerter))),
+            "stichwoerter": ", ".join(
+                sorted(set(woerter))
+            ),
             "gefunden_auf": url,
         })
 
-    # Überschriften ohne Link (manche Seiten listen Stellen nur als Text)
-    for ueberschrift in soup.find_all(["h2", "h3", "h4"]):
-        text = ueberschrift.get_text(" ", strip=True)
+    # Manche Internetseiten führen Stellen nur als Überschrift auf,
+    # ohne dass die Überschrift direkt verlinkt ist.
+    for ueberschrift in soup.find_all([
+        "h2",
+        "h3",
+        "h4",
+    ]):
+        text = ueberschrift.get_text(
+            " ",
+            strip=True
+        )
+
+        # Ausbildungsangebote und fachlich unpassende Überschriften
+        # ebenfalls entfernen.
+        if ist_unpassender_treffer(text, url):
+            continue
+
+        # Allgemeine Überschriften wie "Karriere" oder
+        # "Stellenangebote" nicht als Stelle speichern.
+        if ist_allgemeine_stellenseite(text, url):
+            continue
+
         woerter = finde_stichwoerter(text)
+
         if woerter and len(text) < 200:
-            # Text bis zur nächsten Überschrift für die Arbeitszeit nutzen
             abschnitt = text
+
             for geschwister in ueberschrift.find_next_siblings():
-                if geschwister.name in ("h2", "h3", "h4"):
+                if geschwister.name in (
+                    "h2",
+                    "h3",
+                    "h4",
+                ):
                     break
-                abschnitt += " " + geschwister.get_text(" ", strip=True)
+
+                abschnitt += (
+                    " "
+                    + geschwister.get_text(
+                        " ",
+                        strip=True
+                    )
+                )
+
             treffer.append({
-                "ort": ort, "titel": text,
-                "arbeitszeit": ermittle_arbeitszeit(abschnitt[:3000]),
+                "ort": ort,
+                "titel": text,
+                "arbeitszeit": ermittle_arbeitszeit(
+                    abschnitt[:3000]
+                ),
                 "link": url,
-                "stichwoerter": ", ".join(sorted(set(woerter))),
+                "stichwoerter": ", ".join(
+                    sorted(set(woerter))
+                ),
                 "gefunden_auf": url,
             })
+
     return treffer
 
 
